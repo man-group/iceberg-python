@@ -21,7 +21,8 @@ import json
 import logging
 import os
 from copy import copy
-from functools import lru_cache, partial
+from functools import partial
+from threading import Condition
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -32,6 +33,7 @@ from typing import (
 from urllib.parse import urlparse
 
 import requests
+from cachetools import LRUCache, cachedmethod
 from fsspec import AbstractFileSystem
 from fsspec.implementations.local import LocalFileSystem
 from requests import HTTPError
@@ -370,8 +372,12 @@ class FsspecFileIO(FileIO):
     def __init__(self, properties: Properties):
         self._scheme_to_fs = {}
         self._scheme_to_fs.update(SCHEME_TO_FS)
-        self.get_fs: Callable[[str], AbstractFileSystem] = lru_cache(self._get_fs)
+        self._setup_fs_cache()
         super().__init__(properties=properties)
+
+    def _setup_fs_cache(self) -> None:
+        self._fs_cache = LRUCache(maxsize=128)
+        self._fs_cache_condition = Condition()
 
     def new_input(self, location: str) -> FsspecInputFile:
         """Get an FsspecInputFile instance to read bytes from the file at the given location.
@@ -416,7 +422,8 @@ class FsspecFileIO(FileIO):
         fs = self.get_fs(uri.scheme)
         fs.rm(str_location)
 
-    def _get_fs(self, scheme: str) -> AbstractFileSystem:
+    @cachedmethod(cache=lambda self: self._fs_cache, condition=lambda self: self._fs_cache_condition)
+    def get_fs(self, scheme: str) -> AbstractFileSystem:
         """Get a filesystem for a specific scheme."""
         if scheme not in self._scheme_to_fs:
             raise ValueError(f"No registered filesystem for scheme: {scheme}")
@@ -425,10 +432,11 @@ class FsspecFileIO(FileIO):
     def __getstate__(self) -> Dict[str, Any]:
         """Create a dictionary of the FsSpecFileIO fields used when pickling."""
         fileio_copy = copy(self.__dict__)
-        fileio_copy["get_fs"] = None
+        del fileio_copy["_fs_cache"]
+        del fileio_copy["_fs_cache_condition"]
         return fileio_copy
 
     def __setstate__(self, state: Dict[str, Any]) -> None:
         """Deserialize the state into a FsSpecFileIO instance."""
         self.__dict__ = state
-        self.get_fs = lru_cache(self._get_fs)
+        self._setup_fs_cache()
