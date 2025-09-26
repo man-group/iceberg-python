@@ -14,6 +14,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+import copy
 import math
 from abc import ABC, abstractmethod
 from functools import singledispatch
@@ -1181,6 +1182,7 @@ class _InclusiveMetricsEvaluator(_MetricsEvaluator):
             # be updated once we implemented and set correct record count.
             return ROWS_MIGHT_MATCH
 
+        # If we start doing more than shallow mutation, we need to update `eval_thread_safe`.
         self.value_counts = file.value_counts or EMPTY_DICT
         self.null_counts = file.null_value_counts or EMPTY_DICT
         self.nan_counts = file.nan_value_counts or EMPTY_DICT
@@ -1188,6 +1190,11 @@ class _InclusiveMetricsEvaluator(_MetricsEvaluator):
         self.upper_bounds = file.upper_bounds or EMPTY_DICT
 
         return visit(self.expr, self)
+
+    def eval_thread_safe(self, file: DataFile) -> bool:
+        """Test whether the file may contain records that match the expression. Thread-safe."""
+        # `eval` only mutates the counts and bounds instance variables, so a shallow copy is sufficient.
+        return copy.copy(self).eval(file)
 
     def _may_contain_null(self, field_id: int) -> bool:
         return self.null_counts is None or (field_id in self.null_counts and self.null_counts.get(field_id) is not None)

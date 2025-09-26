@@ -16,8 +16,10 @@
 # under the License.
 from __future__ import annotations
 
+import cachetools
 import itertools
 import os
+import threading
 import uuid
 import warnings
 from abc import ABC, abstractmethod
@@ -1871,15 +1873,25 @@ class DataScan(TableScan):
         schema = self.table_metadata.schema()
         include_empty_files = strtobool(self.options.get("include_empty_files", "false"))
 
-        # The lambda created here is run in multiple threads.
-        # So we avoid creating _InclusiveMetricsEvaluator methods bound to a single
-        # shared instance across multiple threads.
-        return lambda data_file: _InclusiveMetricsEvaluator(
-            schema,
-            self.row_filter,
-            self.case_sensitive,
-            include_empty_files,
-        ).eval(data_file)
+        # The lambda created here can be called a lot when there are many manifest entries. As initialisation of
+        # `_InclusiveMetricsEvaluator` takes time, we lazily initialise a single instance and share it across threads.
+
+        metrics_evaluator_cache = cachetools.Cache(maxsize=1)
+        @cachetools.cached(
+            cache=metrics_evaluator_cache,
+            # `condition` is used, rather than `lock`, to protect against cache stampede
+            condition=threading.Condition(threading.Lock()),
+        )
+        def get_metrics_evaluator_cached_thread_safe() -> _InclusiveMetricsEvaluator:
+            """Thread-safe, cached getter for a `_InclusiveMetricsEvaluator`"""
+            return _InclusiveMetricsEvaluator(
+                schema,
+                self.row_filter,
+                self.case_sensitive,
+                include_empty_files,
+            )
+
+        return lambda data_file: get_metrics_evaluator_cached_thread_safe().eval_thread_safe(data_file)
 
     def _build_residual_evaluator(self, spec_id: int) -> Callable[[DataFile], ResidualEvaluator]:
         spec = self.table_metadata.specs()[spec_id]
@@ -1949,6 +1961,7 @@ class DataScan(TableScan):
         positional_delete_entries = SortedList(key=lambda entry: entry.sequence_number or INITIAL_SEQUENCE_NUMBER)
 
         executor = ExecutorFactory.get_or_create()
+        metrics_evaluator = self._build_metrics_evaluator()
         for manifest_entry in chain(
             *executor.map(
                 lambda args: _open_manifest(*args),
@@ -1957,7 +1970,7 @@ class DataScan(TableScan):
                         self.io,
                         manifest,
                         partition_evaluators[manifest.partition_spec_id],
-                        self._build_metrics_evaluator(),
+                        metrics_evaluator,
                     )
                     for manifest in manifests
                     if self._check_sequence_number(min_sequence_number, manifest)
